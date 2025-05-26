@@ -289,11 +289,12 @@ if __name__ == "__main__":
         logging.info(f"Servidor de métricas Prometheus iniciado en el puerto {METRICS_PORT}.")
     except Exception as e_metrics:
         logging.error(f"No se pudo iniciar el servidor de métricas Prometheus en el puerto {METRICS_PORT}: {e_metrics}")
+        exit(1)
 
-    logging.info(f"Iniciando monitor.")
-    
-    while True:
-        try:
-            main()
-        except Exception as e:
-            logging.error(f"Error inesperado en loop principal: {e}", exc_info=True)
+    logging.info(f"Ejecutando la lógica principal del script.")
+    try:
+        main()
+        logging.info("Lógica principal completada.")
+    except Exception as e:
+        logging.error(f"Error durante la ejecución de main(): {e}", exc_info=True)
+        exit(1)
