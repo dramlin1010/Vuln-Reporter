@@ -52,8 +52,8 @@ logging.basicConfig(
 
 last_check_time = None
 
-cve_critical_found_in_last_run = Gauge(
-    'cve_critical_found_in_last_run_total',
+cve_critical_total = Gauge(
+    'cve_critical_total',
     'Número de vulnerabilidades críticas (CVSS>=9) encontradas en la última revisión por fuente',
     ['source']
 )
@@ -267,8 +267,8 @@ def main():
     k8s_sent, k8s_critical_found = process_kubernetes_vulnerabilities()
     rh_sent, rh_critical_found = process_redhat_vulnerabilities()
     
-    cve_critical_found_in_last_run.labels(source=SOURCE_KUBERNETES).set(k8s_critical_found)
-    cve_critical_found_in_last_run.labels(source=SOURCE_REDHAT).set(rh_critical_found)
+    cve_critical_total.labels(source=SOURCE_KUBERNETES).set(k8s_critical_found)
+    cve_critical_total.labels(source=SOURCE_REDHAT).set(rh_critical_found)
     logging.info(f"Métricas de Prometheus actualizadas: K8s Críticas={k8s_critical_found}, RH Críticas={rh_critical_found}")
 
     logging.info(f"Ciclo completado. Enviadas: K8s={k8s_sent}, RH={rh_sent}.")
