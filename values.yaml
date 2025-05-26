@@ -1,37 +1,42 @@
-# values.yaml overrides for kube-prometheus-stack
+kube-state-metrics:
+  enabled: false
+prometheus-node-exporter:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
 
-## Añadimos el ServiceMonitor para el exporter de CVEs
-additionalServiceMonitors:
-  - name: vuln-reporter
-    selector:
-      matchLabels:
-        app: vuln-reporter
-    endpoints:
-      - port: http
-        interval: 15s
+server:
+  alertmanagers:
+    - scheme: http
+      static_configs:
+        - targets:
+            - prometheus-alertmanager:9093
 
-## Definimos la regla de alerta en Prometheus
-additionalPrometheusRulesMap:
-  cve-alerts:
+serverFiles:
+  prometheus.yml:
+    global:
+      scrape_interval: 1m
+    rule_files:
+      - /etc/config/alerting_rules.yml
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+      - job_name: 'vuln-reporter'
+        static_configs:
+          - targets: ['vuln-reporter-svc:8000']
+
+  alerting_rules.yml:
     groups:
-      - name: cve-alerts
+      - name: cve-critical-alert
         rules:
-          - alert: KubernetesOpenShiftCriticalVulnerability
+          - alert: CriticalCVEDetected
             expr: cve_critical_total > 0
-            for: 1m
+            for: 5m
             labels:
               severity: critical
             annotations:
-              summary: "Hay vulnerabilidades CRÍTICAS nuevas en K8s/OpenShift"
-              description: "Se han detectado {{ $value }} vulnerabilidades con CVSS ≥9."
-
-## Configuración de Alertmanager para enviar las críticas a Teams
-alertmanager:
-  config:
-    route:
-      group_by:
-        - alertname
-      group_wait:   30s
-      group_interval: 5m
-      repeat_interval: 2h
-
+              summary: "Se han detectado vulnerabilidades críticas"
+              description: >-
+                Se ha registrado al menos una vulnerabilidad con CVSS ≥ 9.0.
+                Número de críticas: {{ $value }}.
