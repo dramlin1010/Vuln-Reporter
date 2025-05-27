@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import os
 import time
 import logging
 import requests
@@ -7,38 +8,11 @@ import re
 import json
 from prometheus_client import start_http_server, Gauge
 
-LAST_SUCCESSFUL_RUN_TIME_FILE = "last_run_state.json"
-CONFIG_FILE = 'config.cfg'
-PLACEHOLDER_WEBHOOK_VALUE = "WEBHOOK_NO_CONFIGURADO"
-DEFAULT_METRICS_PORT = 8000
+STATE_FILE = "run_state.json"
 
 config = configparser.ConfigParser()
-TEAMS_WEBHOOK = PLACEHOLDER_WEBHOOK_VALUE
-METRICS_PORT = DEFAULT_METRICS_PORT
-
-try:
-    files_read = config.read(CONFIG_FILE)
-    if not files_read:
-        logging.warning(f"Archivo de configuración '{CONFIG_FILE}' no encontrado o no se pudo leer. Se usarán valores por defecto/placeholders. Por favor, crea y configura '{CONFIG_FILE}'.")
-    else:
-        logging.info(f"Archivo de configuración '{CONFIG_FILE}' leído exitosamente.")
-        retrieved_webhook = config.get('webhook', 'webhook_url', fallback=PLACEHOLDER_WEBHOOK_VALUE)
-        if retrieved_webhook and retrieved_webhook.strip() and retrieved_webhook != PLACEHOLDER_WEBHOOK_VALUE:
-            TEAMS_WEBHOOK = retrieved_webhook
-        else:
-            TEAMS_WEBHOOK = PLACEHOLDER_WEBHOOK_VALUE
-            if retrieved_webhook != PLACEHOLDER_WEBHOOK_VALUE:
-                logging.warning(f"La clave 'webhook_url' en '{CONFIG_FILE}' está vacía o no se encontró. Usando placeholder.")
-
-except configparser.Error as e_cfg_parser:
-    logging.error(f"Error al parsear el archivo de configuración '{CONFIG_FILE}': {e_cfg_parser}. Se usarán valores por defecto/placeholders.")
-    TEAMS_WEBHOOK = PLACEHOLDER_WEBHOOK_VALUE
-    METRICS_PORT = DEFAULT_METRICS_PORT
-    
-except Exception as e_config:
-    logging.error(f"Error inesperado al leer o procesar el archivo de configuración '{CONFIG_FILE}': {e_config}. Se usarán valores por defecto/placeholders.")
-    TEAMS_WEBHOOK = PLACEHOLDER_WEBHOOK_VALUE
-    METRICS_PORT = DEFAULT_METRICS_PORT
+TEAMS_WEBHOOK = os.getenv("TEAMS_WEBHOOK")
+METRICS_PORT = 8000
 
 KUBERNETES_CVE_FEED_URL = "https://kubernetes.io/docs/reference/issues-security/official-cve-feed/index.json"
 REDHAT_API_URL = "https://access.redhat.com/labs/securitydataapi/cve.json"
@@ -65,27 +39,50 @@ repetidas, ya que seria redundante.
 """
 
 def load_last_run_state(filename, default_timedelta_hours=1):
+    """
+    Carga el estado previo (última fecha y conjunto de IDs procesados).
+    Si no existe o está corrupto, devuelve:
+      - last_check = ahora - default_timedelta_hours
+      - processed_ids = set()
+    Retorna: (last_check_datetime, processed_ids_set)
+    """
     try:
         with open(filename, 'r') as f:
             data = json.load(f)
+            # Timestamp
             last_time_str = data.get("last_check_time_utc_iso")
             if last_time_str:
-                dt_aware = datetime.fromisoformat(last_time_str.replace('Z', '+00:00'))
-                return dt_aware.astimezone(timezone.utc).replace(tzinfo=None)
-    except FileNotFoundError:
-        logging.info(f"Archivo '{filename}' no encontrado. Usando delta por defecto.")
-    except (json.JSONDecodeError, Exception) as e:
-        logging.warning(f"Error al cargar estado de '{filename}': {e}. Usando delta por defecto.")
-    return datetime.utcnow() - timedelta(hours=default_timedelta_hours)
+                dt = datetime.fromisoformat(last_time_str.replace('Z', '+00:00'))
+                last_check = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            else:
+                last_check = datetime.utcnow() - timedelta(hours=default_timedelta_hours)
+            # IDs procesados
+            processed = set(data.get("processed_ids", []))
+            return last_check, processed
+    except (FileNotFoundError, json.JSONDecodeError):
+        logging.info(f"Estado no encontrado o inválido en '{filename}'. Usando valores por defecto.")
+        return datetime.utcnow() - timedelta(hours=default_timedelta_hours), set()
 
-def save_last_run_state(filename, time_to_save_utc):
+def save_last_run_state(filename, last_check_time_utc, processed_ids):
+    """
+    Guarda el estado actual en JSON:
+      - last_check_time_utc_iso: timestamp ISO con sufijo 'Z'
+      - processed_ids: lista de CVE IDs únicos
+    Parámetros:
+      filename            – ruta del JSON de estado
+      last_check_time_utc – datetime UTC de esta ejecución
+      processed_ids       – iterable de IDs ya procesados
+    """
     try:
+        data = {
+            "last_check_time_utc_iso": last_check_time_utc.isoformat() + "Z",
+            "processed_ids": list(processed_ids)
+        }
         with open(filename, 'w') as f:
-            data = {"last_check_time_utc_iso": time_to_save_utc.isoformat() + "Z"}
             json.dump(data, f, indent=2)
         logging.info(f"Estado guardado en '{filename}'.")
     except Exception as e:
-        logging.error(f"Error al guardar estado en '{filename}': {e}")
+        logging.error(f"Error al guardar estado: {e}")
 
 def get_severity_text_and_color(score):
     score = float(score) if score is not None else 0.0
@@ -127,9 +124,6 @@ def post_to_teams(cve_id, title, description, score, url, source_name, published
     if score >= 9.0:
         card["prometheus_alert_tag"] = "critical_vulnerability"
 
-    if not TEAMS_WEBHOOK or TEAMS_WEBHOOK == PLACEHOLDER_WEBHOOK_VALUE:
-        logging.error(f"TEAMS_WEBHOOK no configurado en '{CONFIG_FILE}'.")
-        return False
     try:
         response = requests.post(TEAMS_WEBHOOK, json=card, timeout=10)
         response.raise_for_status()
@@ -184,103 +178,116 @@ def fetch_kubernetes_vulnerabilities(start_date_utc_naive):
         logging.error(f"Error Kubernetes CVE Feed: {e}")
     return []
 
-def process_kubernetes_vulnerabilities():
-    logging.info(f"Procesando Kubernetes CVEs - 2 MÁS RECIENTES")
-    kubernetes_items = fetch_kubernetes_vulnerabilities(last_check_time) 
+def process_kubernetes_vulnerabilities(last_check_time, processed_ids):
+    logging.info("Procesando Kubernetes CVEs con deduplicación.")
+    kubernetes_items = fetch_kubernetes_vulnerabilities(last_check_time)
 
     if not kubernetes_items:
-        logging.info("No se encontraron vulnerabilidades de Kubernetes para procesar (2 más recientes).")
+        logging.info("No se encontraron vulnerabilidades de Kubernetes para procesar.")
         return 0, 0
 
     count_sent = 0
     critical_found_count = 0
+
     for item in kubernetes_items:
         cve_id = item.get("id")
-        if not cve_id: continue
+        if not cve_id or cve_id in processed_ids:
+            continue
+
         description = item.get("summary", "No descripción.")
         score, _ = parse_kubernetes_content_text(item.get("content_text", ""))
         if score >= 9.0:
             critical_found_count += 1
+
         published_date_str = item.get("date_published", "N/A").split("T")[0]
         details_url = item.get("external_url", item.get("url", "#"))
-        if post_to_teams(cve_id, f"Vulnerabilidad Kubernetes: {cve_id}", description, score, details_url, SOURCE_KUBERNETES, published_date_str):
+
+        if post_to_teams(
+            cve_id,
+            f"Vulnerabilidad Kubernetes: {cve_id}",
+            description,
+            score,
+            details_url,
+            SOURCE_KUBERNETES,
+            published_date_str
+        ):
             count_sent += 1
-    logging.info(f"Kubernetes: {count_sent} alertas enviadas de {len(kubernetes_items)} (2 más recientes). Críticas encontradas: {critical_found_count}.")
+
+        # Marcamos este CVE como procesado para no reenviarlo
+        processed_ids.add(cve_id)
+
+    logging.info(f"Kubernetes: enviadas={count_sent}, críticas nuevas={critical_found_count}.")
     return count_sent, critical_found_count
 
-def process_redhat_vulnerabilities():
-    logging.info(f"Procesando Red Hat CVEs - 2 MÁS RECIENTES")
+def process_redhat_vulnerabilities(last_check_time, processed_ids):
+    logging.info("Procesando Red Hat CVEs con deduplicación.")
+    # Usamos un rango amplio para luego quedarnos con los 2 más recientes
     ninety_days_ago = datetime.utcnow() - timedelta(days=90)
-    logging.info(f"2 MÁS RECIENTES: Consultando Red Hat API con 'after={ninety_days_ago.strftime('%Y-%m-%d')}' para obtener un conjunto amplio.")
     rh_items_all = fetch_redhat_vulnerabilities(ninety_days_ago)
-    
-    logging.info(f"Red Hat API devolvió {len(rh_items_all)} items (consulta amplia para test).")
-    
-    valid_items_with_dates = []
-    for item_idx, cve_item in enumerate(rh_items_all):
-        public_date_str = cve_item.get("public_date")
-        if public_date_str:
-            try:
-                item_published_date_aware = datetime.fromisoformat(public_date_str.replace('Z', '+00:00'))
-                item_published_date_naive_utc = item_published_date_aware.astimezone(timezone.utc).replace(tzinfo=None)
-                valid_items_with_dates.append({"item_data": cve_item, "published_date": item_published_date_naive_utc})
-            except ValueError as e:
-                logging.warning(f"Error al parsear fecha Red Hat: {cve_item.get('CVE')}, {public_date_str}")
-        else:
-            logging.warning(f"Item de Red Hat (idx {item_idx}, CVE {cve_item.get('CVE')}) sin 'public_date'. Se omitirá para ordenamiento.")
 
-    valid_items_with_dates.sort(key=lambda x: x["published_date"], reverse=True)
-    
-    items_to_process = [entry["item_data"] for entry in valid_items_with_dates[:2]]
-    
-    logging.info(f"Red Hat: {len(items_to_process)} items seleccionados para procesar (los 2 más recientes).")
+    # Filtrar y ordenar por fecha de publicación
+    valid = []
+    for item in rh_items_all:
+        pub = item.get("public_date")
+        if not pub:
+            continue
+        try:
+            dt = datetime.fromisoformat(pub.replace('Z', '+00:00'))
+            valid.append((dt, item))
+        except ValueError:
+            continue
+    valid.sort(key=lambda x: x[0], reverse=True)
+    recent_items = [itm for _, itm in valid[:2]]
 
-    if not items_to_process:
-        logging.info("No se encontraron vulnerabilidades de OpenShift (Red Hat) para procesar en modo '2 más recientes'.")
+    if not recent_items:
+        logging.info("No se encontraron vulnerabilidades de Red Hat para procesar.")
         return 0, 0
 
     count_sent = 0
     critical_found_count = 0
-    for item in items_to_process:
+
+    for item in recent_items:
         cve_id = item.get("CVE")
-        if not cve_id: continue
+        if not cve_id or cve_id in processed_ids:
+            continue
+
         description = item.get("bugzilla_description", item.get("description", "No descripción."))
-        score_str = item.get("cvss3_score")
-        score = 0.0
-        try: score = float(score_str) if score_str is not None else 0.0
-        except (ValueError, TypeError): score = 0.0
-        
+        try:
+            score = float(item.get("cvss3_score", 0.0))
+        except (ValueError, TypeError):
+            score = 0.0
         if score >= 9.0:
             critical_found_count += 1
-        
+
         published_date_str = item.get("public_date", "N/A").split("T")[0]
         details_url = item.get("resource_url", f"https://access.redhat.com/security/cve/{cve_id}")
-        if post_to_teams(cve_id, f"Vulnerabilidad OpenShift: {cve_id}", description, score, details_url, SOURCE_REDHAT, published_date_str):
+
+        if post_to_teams(
+            cve_id,
+            f"Vulnerabilidad OpenShift: {cve_id}",
+            description,
+            score,
+            details_url,
+            SOURCE_REDHAT,
+            published_date_str
+        ):
             count_sent += 1
-    logging.info(f"Red Hat: {count_sent} alertas enviadas de {len(items_to_process)} (2 más recientes). Críticas encontradas: {critical_found_count}.")
+
+        # Marcamos este CVE como procesado para no reenviarlo
+        processed_ids.add(cve_id)
+
+    logging.info(f"Red Hat: enviadas={count_sent}, críticas nuevas={critical_found_count}.")
     return count_sent, critical_found_count
 
-def main():
-    global last_check_time
-    current_run_time_utc = datetime.utcnow()
-    logging.info(f"--- Iniciando ciclo (desde {last_check_time.isoformat()}Z) ---")
-    
-    k8s_sent, k8s_critical_found = process_kubernetes_vulnerabilities()
-    rh_sent, rh_critical_found = process_redhat_vulnerabilities()
-    
-    cve_critical_total.labels(source=SOURCE_KUBERNETES).set(k8s_critical_found)
-    cve_critical_total.labels(source=SOURCE_REDHAT).set(rh_critical_found)
-    logging.info(f"Métricas de Prometheus actualizadas: K8s Críticas={k8s_critical_found}, RH Críticas={rh_critical_found}")
-
-    logging.info(f"Ciclo completado. Enviadas: K8s={k8s_sent}, RH={rh_sent}.")
-    save_last_run_state(LAST_SUCCESSFUL_RUN_TIME_FILE, current_run_time_utc)
-    last_check_time = current_run_time_utc
+# ----------------------------------
+# Arranque y bucle principal
+# ----------------------------------
 
 if __name__ == "__main__":
-    # Carga el último timestamp guardado (o usa el por defecto)
-    last_check_time = load_last_run_state(LAST_SUCCESSFUL_RUN_TIME_FILE)
+    # 1) Carga timestamp e IDs ya procesados
+    last_check_time, processed_ids = load_last_run_state(STATE_FILE)
     
-    # Arranca el HTTP server de prometheus_client PARALELO al bucle principal
+    # 2) Inicia servidor de métricas
     try:
         start_http_server(METRICS_PORT)
         logging.info(f"Servidor de métricas Prometheus iniciado en el puerto {METRICS_PORT}.")
@@ -288,21 +295,28 @@ if __name__ == "__main__":
         logging.error(f"No se pudo iniciar el servidor de métricas en el puerto {METRICS_PORT}: {e_metrics}")
         exit(1)
 
-    # Comprueba webhook
-    if not TEAMS_WEBHOOK or TEAMS_WEBHOOK == PLACEHOLDER_WEBHOOK_VALUE:
-        logging.critical(f"TEAMS_WEBHOOK no configurado en '{CONFIG_FILE}'. El script no puede enviar notificaciones. Saliendo.")
-        exit(1)
-    logging.info("TEAMS_WEBHOOK configurado. Notificaciones se enviarán a Teams.")
-
-    # Bucle infinito: cada 5 minutos ejecuta main() y actualiza la métrica
     intervalo_segundos = 5 * 60  # 5 minutos
 
+    # 3) Bucle infinito
     while True:
-        current_run_time_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-        logging.info(f"--- Iniciando ciclo a las {current_run_time_utc.isoformat()} ---")
+        now_utc = datetime.utcnow().replace(tzinfo=timezone.utc).replace(tzinfo=None)
+        logging.info(f"--- Iniciando ciclo a las {now_utc.isoformat()}Z ---")
+
         try:
-            main()
-            logging.info(f"Esperando {intervalo_segundos}s hasta la siguiente ejecución...")
+            # Ejecuta el trabajo y actualiza métricas
+            k8s_sent, k8s_crit = process_kubernetes_vulnerabilities(last_check_time, processed_ids)
+            rh_sent,  rh_crit  = process_redhat_vulnerabilities (last_check_time, processed_ids)
+            
+            cve_critical_total.labels(source=SOURCE_KUBERNETES).set(k8s_crit)
+            cve_critical_total.labels(source=SOURCE_REDHAT)    .set(rh_crit)
+            
+            # Actualiza último timestamp y guarda el estado completo
+            last_check_time = now_utc
+            save_last_run_state(STATE_FILE, last_check_time, processed_ids)
+
+            logging.info(f"Ciclo completado. Enviadas: K8s={k8s_sent}, RH={rh_sent}.")
         except Exception as e:
             logging.error(f"Error en ciclo principal: {e}", exc_info=True)
+
+        logging.info(f"Esperando {intervalo_segundos}s hasta la siguiente ejecución...")
         time.sleep(intervalo_segundos)
