@@ -21,7 +21,7 @@ SOURCE_KUBERNETES = "Kubernetes Official CVE Feed"
 SOURCE_REDHAT = "Red Hat (OpenShift)"
 
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s"
 )
 
@@ -154,7 +154,7 @@ def fetch_kubernetes_vulnerabilities(start_date_utc_naive):
         data = resp.json()
         all_items = data.get("items", [])
         logging.info(f"Kubernetes Feed devolvió {len(all_items)} items en total.")
-        
+
         valid_items_with_dates = []
         for item_idx, item in enumerate(all_items):
             published_str = item.get("date_published", "").rstrip("Z")
@@ -167,11 +167,11 @@ def fetch_kubernetes_vulnerabilities(start_date_utc_naive):
                 valid_items_with_dates.append({"item_data": item, "published_date": item_published_date_naive_utc})
             except ValueError as e:
                 logging.error(f"Error al parsear fecha para item de Kubernetes (idx {item_idx}, ID {item.get('id')}): {item.get('date_published')} - {e}")
-        
+
         valid_items_with_dates.sort(key=lambda x: x["published_date"], reverse=True)
-        
+
         recent_items_data = [entry["item_data"] for entry in valid_items_with_dates[:2]]
-        
+
         logging.info(f"Kubernetes Feed: {len(recent_items_data)} items seleccionados (los 2 más recientes).")
         return recent_items_data
     except (requests.exceptions.RequestException, ValueError) as e:
@@ -286,7 +286,7 @@ def process_redhat_vulnerabilities(last_check_time, processed_ids):
 if __name__ == "__main__":
     # 1) Carga timestamp e IDs ya procesados
     last_check_time, processed_ids = load_last_run_state(STATE_FILE)
-    
+
     # 2) Inicia servidor de métricas
     try:
         start_http_server(METRICS_PORT)
@@ -306,10 +306,10 @@ if __name__ == "__main__":
             # Ejecuta el trabajo y actualiza métricas
             k8s_sent, k8s_crit = process_kubernetes_vulnerabilities(last_check_time, processed_ids)
             rh_sent,  rh_crit  = process_redhat_vulnerabilities (last_check_time, processed_ids)
-            
+
             cve_critical_total.labels(source=SOURCE_KUBERNETES).set(k8s_crit)
             cve_critical_total.labels(source=SOURCE_REDHAT)    .set(rh_crit)
-            
+
             # Actualiza último timestamp y guarda el estado completo
             last_check_time = now_utc
             save_last_run_state(STATE_FILE, last_check_time, processed_ids)
