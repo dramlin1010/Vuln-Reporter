@@ -152,15 +152,13 @@ def parse_kubernetes_content_text(content_text):
 
 def fetch_kubernetes_vulnerabilities(start_date_utc_naive):
     logging.info(f"Consultando Kubernetes CVE Feed: {KUBERNETES_CVE_FEED_URL}")
-    logging.info("Seleccionando los 2 CVEs más recientes de Kubernetes.")
     try:
         resp = requests.get(KUBERNETES_CVE_FEED_URL, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         all_items = data.get("items", [])
-        logging.info(f"Kubernetes Feed devolvió {len(all_items)} items en total.")
-        
-        valid_items_with_dates = []
+        new_items = []
+        logging.info(f"Kubernetes Feed devolvió {len(all_items)} items en total. Filtrando desde {start_date_utc_naive.isoformat()}Z.")
         for item_idx, item in enumerate(all_items):
             published_str = item.get("date_published", "").rstrip("Z")
             if not published_str:
@@ -169,26 +167,23 @@ def fetch_kubernetes_vulnerabilities(start_date_utc_naive):
             try:
                 item_published_date_aware = datetime.fromisoformat(published_str.replace('Z', '+00:00'))
                 item_published_date_naive_utc = item_published_date_aware.astimezone(timezone.utc).replace(tzinfo=None)
-                valid_items_with_dates.append({"item_data": item, "published_date": item_published_date_naive_utc})
+                if item_published_date_naive_utc >= start_date_utc_naive:
+                    new_items.append(item)
+                    logging.debug(f"K8S Item (idx {item_idx}, ID {item.get('id')}) SELECCIONADO (nuevo).")
             except ValueError as e:
                 logging.error(f"Error al parsear fecha para item de Kubernetes (idx {item_idx}, ID {item.get('id')}): {item.get('date_published')} - {e}")
-        
-        valid_items_with_dates.sort(key=lambda x: x["published_date"], reverse=True)
-        
-        recent_items_data = [entry["item_data"] for entry in valid_items_with_dates[:2]]
-        
-        logging.info(f"Kubernetes Feed: {len(recent_items_data)} items seleccionados (los 2 más recientes).")
-        return recent_items_data
+        logging.info(f"Kubernetes Feed: {len(new_items)} items nuevos encontrados desde la última revisión.")
+        return new_items
     except (requests.exceptions.RequestException, ValueError) as e:
         logging.error(f"Error Kubernetes CVE Feed: {e}")
     return []
 
 def process_kubernetes_vulnerabilities():
-    logging.info(f"Procesando Kubernetes CVEs - 2 MÁS RECIENTES")
+    logging.info(f"Procesando Kubernetes CVEs desde {last_check_time.isoformat()}Z")
     kubernetes_items = fetch_kubernetes_vulnerabilities(last_check_time) 
 
     if not kubernetes_items:
-        logging.info("No se encontraron vulnerabilidades de Kubernetes para procesar (2 más recientes).")
+        logging.info("No se encontraron nuevas vulnerabilidades de Kubernetes desde la última revisión.")
         return 0, 0
 
     count_sent = 0
@@ -204,43 +199,42 @@ def process_kubernetes_vulnerabilities():
         details_url = item.get("external_url", item.get("url", "#"))
         if post_to_teams(cve_id, f"Vulnerabilidad Kubernetes: {cve_id}", description, score, details_url, SOURCE_KUBERNETES, published_date_str):
             count_sent += 1
-    logging.info(f"Kubernetes: {count_sent} alertas enviadas de {len(kubernetes_items)} (2 más recientes). Críticas encontradas: {critical_found_count}.")
+    logging.info(f"Kubernetes: {count_sent} alertas enviadas de {len(kubernetes_items)} nuevas. Críticas encontradas: {critical_found_count}.")
     return count_sent, critical_found_count
 
 def process_redhat_vulnerabilities():
-    logging.info(f"Procesando Red Hat CVEs - 2 MÁS RECIENTES")
-    ninety_days_ago = datetime.utcnow() - timedelta(days=90)
-    logging.info(f"2 MÁS RECIENTES: Consultando Red Hat API con 'after={ninety_days_ago.strftime('%Y-%m-%d')}' para obtener un conjunto amplio.")
-    rh_items_all = fetch_redhat_vulnerabilities(ninety_days_ago)
+    logging.info(f"Procesando Red Hat CVEs desde {last_check_time.isoformat()}Z")
     
-    logging.info(f"Red Hat API devolvió {len(rh_items_all)} items (consulta amplia para test).")
+    query_date_for_api = last_check_time - timedelta(days=1)
+    logging.info(f"Consultando Red Hat API con 'after={query_date_for_api.strftime('%Y-%m-%d')}' para asegurar la inclusión de ítems del día actual.")
+    rh_items_all = fetch_redhat_vulnerabilities(query_date_for_api)
     
-    valid_items_with_dates = []
+    logging.info(f"Red Hat API devolvió {len(rh_items_all)} items (usando 'after' del día anterior).")
+    
+    rh_items_filtered_by_time = []
     for item_idx, cve_item in enumerate(rh_items_all):
         public_date_str = cve_item.get("public_date")
         if public_date_str:
             try:
                 item_published_date_aware = datetime.fromisoformat(public_date_str.replace('Z', '+00:00'))
                 item_published_date_naive_utc = item_published_date_aware.astimezone(timezone.utc).replace(tzinfo=None)
-                valid_items_with_dates.append({"item_data": cve_item, "published_date": item_published_date_naive_utc})
+                if item_published_date_naive_utc >= last_check_time:
+                    rh_items_filtered_by_time.append(cve_item)
+                    logging.debug(f"RH Item (idx {item_idx}, CVE {cve_item.get('CVE')}) SELECCIONADO (nuevo).")
             except ValueError as e:
                 logging.warning(f"Error al parsear fecha Red Hat: {cve_item.get('CVE')}, {public_date_str}")
         else:
-            logging.warning(f"Item de Red Hat (idx {item_idx}, CVE {cve_item.get('CVE')}) sin 'public_date'. Se omitirá para ordenamiento.")
+            logging.warning(f"Item de Red Hat (idx {item_idx}, CVE {cve_item.get('CVE')}) sin 'public_date'. Se omitirá.")
 
-    valid_items_with_dates.sort(key=lambda x: x["published_date"], reverse=True)
-    
-    items_to_process = [entry["item_data"] for entry in valid_items_with_dates[:2]]
-    
-    logging.info(f"Red Hat: {len(items_to_process)} items seleccionados para procesar (los 2 más recientes).")
+    logging.info(f"Red Hat: {len(rh_items_filtered_by_time)} items nuevos encontrados post-filtro de tiempo.")
 
-    if not items_to_process:
-        logging.info("No se encontraron vulnerabilidades de OpenShift (Red Hat) para procesar en modo '2 más recientes'.")
+    if not rh_items_filtered_by_time:
+        logging.info("No se encontraron nuevas vulnerabilidades de OpenShift (Red Hat) desde la última revisión detallada.")
         return 0, 0
 
     count_sent = 0
     critical_found_count = 0
-    for item in items_to_process:
+    for item in rh_items_filtered_by_time:
         cve_id = item.get("CVE")
         if not cve_id: continue
         description = item.get("bugzilla_description", item.get("description", "No descripción."))
@@ -256,7 +250,7 @@ def process_redhat_vulnerabilities():
         details_url = item.get("resource_url", f"https://access.redhat.com/security/cve/{cve_id}")
         if post_to_teams(cve_id, f"Vulnerabilidad OpenShift: {cve_id}", description, score, details_url, SOURCE_REDHAT, published_date_str):
             count_sent += 1
-    logging.info(f"Red Hat: {count_sent} alertas enviadas de {len(items_to_process)} (2 más recientes). Críticas encontradas: {critical_found_count}.")
+    logging.info(f"Red Hat: {count_sent} alertas enviadas de {len(rh_items_filtered_by_time)} nuevas. Críticas encontradas: {critical_found_count}.")
     return count_sent, critical_found_count
 
 def main():
