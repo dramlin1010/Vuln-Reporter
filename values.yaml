@@ -1,0 +1,42 @@
+kube-state-metrics:
+  enabled: false
+prometheus-node-exporter:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
+
+server:
+  alertmanagers:
+    - scheme: http
+      static_configs:
+        - targets:
+            - prometheus-alertmanager:9093
+
+serverFiles:
+  prometheus.yml:
+    global:
+      scrape_interval: 1m
+    rule_files:
+      - /etc/config/alerting_rules.yml
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+      - job_name: 'vuln-reporter'
+        static_configs:
+          - targets: ['vuln-reporter-svc:8000']
+
+  alerting_rules.yml:
+    groups:
+      - name: cve-critical-alert
+        rules:
+          - alert: CriticalCVEDetected
+            expr: cve_critical_total > 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Se han detectado vulnerabilidades críticas"
+              description: >-
+                Se ha registrado al menos una vulnerabilidad con CVSS ≥ 9.0.
+                Número de críticas: {{ $value }}.

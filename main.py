@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import time
 import logging
 import requests
 import configparser
@@ -270,25 +271,32 @@ def main():
     last_check_time = current_run_time_utc
 
 if __name__ == "__main__":
+    # Carga el último timestamp guardado (o usa el por defecto)
     last_check_time = load_last_run_state(LAST_SUCCESSFUL_RUN_TIME_FILE)
-
-    if not TEAMS_WEBHOOK or TEAMS_WEBHOOK == PLACEHOLDER_WEBHOOK_VALUE:
-        logging.critical(f"TEAMS_WEBHOOK no configurado en '{CONFIG_FILE}'. El script no puede enviar notificaciones. Saliendo.")
-        exit(1)
     
-    logging.info(f"TEAMS_WEBHOOK configurado. Notificaciones se enviarán a Teams.")
-
+    # Arranca el HTTP server de prometheus_client PARALELO al bucle principal
     try:
         start_http_server(METRICS_PORT)
         logging.info(f"Servidor de métricas Prometheus iniciado en el puerto {METRICS_PORT}.")
     except Exception as e_metrics:
-        logging.error(f"No se pudo iniciar el servidor de métricas Prometheus en el puerto {METRICS_PORT}: {e_metrics}")
+        logging.error(f"No se pudo iniciar el servidor de métricas en el puerto {METRICS_PORT}: {e_metrics}")
         exit(1)
 
-    logging.info(f"Ejecutando la lógica principal del script.")
-    try:
-        main()
-        logging.info("Lógica principal completada.")
-    except Exception as e:
-        logging.error(f"Error durante la ejecución de main(): {e}", exc_info=True)
+    # Comprueba webhook
+    if not TEAMS_WEBHOOK or TEAMS_WEBHOOK == PLACEHOLDER_WEBHOOK_VALUE:
+        logging.critical(f"TEAMS_WEBHOOK no configurado en '{CONFIG_FILE}'. El script no puede enviar notificaciones. Saliendo.")
         exit(1)
+    logging.info("TEAMS_WEBHOOK configurado. Notificaciones se enviarán a Teams.")
+
+    # Bucle infinito: cada 5 minutos ejecuta main() y actualiza la métrica
+    intervalo_segundos = 5 * 60  # 5 minutos
+
+    while True:
+        current_run_time_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        logging.info(f"--- Iniciando ciclo a las {current_run_time_utc.isoformat()} ---")
+        try:
+            main()
+            logging.info(f"Esperando {intervalo_segundos}s hasta la siguiente ejecución...")
+        except Exception as e:
+            logging.error(f"Error en ciclo principal: {e}", exc_info=True)
+        time.sleep(intervalo_segundos)

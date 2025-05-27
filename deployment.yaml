@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vuln-reporter
+  labels:
+    app: vuln-reporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vuln-reporter
+  template:
+    metadata:
+      labels:
+        app: vuln-reporter
+    spec:
+      containers:
+        - name: vuln-reporter
+          image: vuln_reporter:1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vuln-reporter-svc
+  labels:
+    app: vuln-reporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port:   "8000"
+spec:
+  type: ClusterIP
+  selector:
+    app: vuln-reporter
+  ports:
+    - port:       8000
+      targetPort: 8000
+      protocol:   TCP
+      name:       http
