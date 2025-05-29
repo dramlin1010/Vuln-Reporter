@@ -3,14 +3,12 @@ import os
 import time
 import logging
 import requests
-import configparser
 import re
 import json
 from prometheus_client import start_http_server, Gauge
 
 STATE_FILE = "run_state.json"
 
-config = configparser.ConfigParser()
 TEAMS_WEBHOOK = os.getenv("TEAMS_WEBHOOK")
 METRICS_PORT = 8000
 
